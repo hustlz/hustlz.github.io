@@ -1,45 +1,25 @@
 # 记账本 APP - 技术方案与架构设计
 
-## 1. 技术栈
+## 1. 技术栈（本地优先，保留扩展）
 - 客户端：Flutter（推荐）或 React Native；离线优先与流畅动画。
 - 本地数据库：SQLite（SQLCipher 加密）。
-- 同步后端（可选）：Node.js + TypeScript + PostgreSQL；REST/GraphQL。
-- 云存储：对象存储（附件）；推送：FCM/APNs。
-- 机器学习：本地轻量分类器 + 云端微服务（可选）。
+- 同步后端（可选扩展）：Node.js + TypeScript + PostgreSQL；REST/GraphQL。
+- 云存储（扩展）：对象存储（附件）；推送：FCM/APNs。
+- 机器学习（扩展）：本地轻量分类器 + 云端微服务。
 
 ## 2. 架构概览
-- Offline-first：核心操作本地完成；后台增量同步。
+- Offline-first：所有核心操作在本地完成；未来可插拔同步模块。
 - 分层：UI → 应用层（用例/服务）→ 数据层（Repository + DB/Network）。
-- 同步：per-row `updated_at` + `deleted` 软删，乐观合并；冲突策略 LWW + 领域规则（转账一致性）。
+- 同步抽象：定义 `SyncService` 接口，默认实现为 `NoopSyncService`；启用云后替换为 `RemoteSyncService`。
 - 多账本（Ledger）：账本级配置包含 `month_start_day`。
 
-## 3. 数据模型（SQLite/PostgreSQL 对齐）
-- `users(id, email, display_name, created_at, updated_at, deleted)`
-- `ledgers(id, name, owner_id, month_start_day INTEGER CHECK(1<=month_start_day AND month_start_day<=28), currency, created_at, updated_at, deleted)`
-- `members(id, ledger_id, user_id, role, created_at, updated_at, deleted)`
-- `accounts(id, ledger_id, name, type, currency, initial_balance, created_at, updated_at, deleted)`
-- `categories(id, ledger_id, parent_id, name, type CHECK(type IN ('expense','income')), icon, color, created_at, updated_at, deleted)`
-- `transactions(id, ledger_id, type CHECK(type IN ('expense','income','transfer')), amount_cents INTEGER NOT NULL, account_id, account_id_to, category_id, merchant, note, tags_text, occurred_at DATETIME NOT NULL, created_at, updated_at, deleted)`
-  - 约束：`transfer` 需 `account_id` 与 `account_id_to`；不计入收支汇总。
-- `attachments(id, transaction_id, kind, url_or_path, created_at, updated_at, deleted)`
-- `budgets(id, ledger_id, cycle_kind CHECK(cycle_kind IN ('monthly','yearly')), category_id NULL, amount_cents, start_date, end_date NULL, created_at, updated_at, deleted)`
-- `settings(id, ledger_id, key, value, created_at, updated_at, deleted)`
+## 3. 数据模型（SQLite）
+- 同原始方案，表结构保持不变，以兼容未来云同步（含 `updated_at`、`deleted` 软删位）。
 
-索引建议：`transactions(ledger_id, occurred_at, updated_at)`；`categories(ledger_id, type)`；`accounts(ledger_id)`；`budgets(ledger_id, cycle_kind)`。
-
-## 4. 关键领域逻辑
+## 4. 关键领域逻辑（本地实现）
 ### 4.1 自定义账期（月起始日）
-- 定义：给定 `month_start_day = S (1..28)`，账期区间为 `[cycle_start, next_cycle_start)`。
-- 伪代码：
-```pseudo
-function computeCycleStart(date d, int S):
-  if day(d) >= S:
-    return date(year(d), month(d), S)
-  else:
-    let d0 = addMonths(date(year(d), month(d), 1), -1)
-    return date(year(d0), month(d0), S)
-```
-- SQLite 分组（排除转账）：
+- 同原始算法与 SQL 分组（见下方 SQL 片段）。
+
 ```sql
 WITH cte AS (
   SELECT t.category_id,
@@ -69,63 +49,52 @@ ORDER BY cycle_start DESC;
 ```
 
 ### 4.2 预算执行与提醒
-- 存储：`budgets(cycle_kind, category_id, amount_cents)`。
-- 计算：沿用 4.1 的 `cycle_start`；执行率 `spent/limit`。
-- 提醒：本地定时任务；阈值（70%/100%）触发通知；跨设备使用推送。
+- 本地定时任务；阈值（70%/100%）触发系统通知。
 
 ### 4.3 多账户与转账一致性
-- 记录转账：原子写入两条流水（或单条含 `account_id_to` 并在视图层拆分），保持余额正确。
+- 原子写入两条流水（或单条含 `account_id_to` 并在视图层拆分）。
 
-## 5. API 设计（后端可选）
-- 鉴权：OAuth/Email+Magic Link；`Authorization: Bearer`。
-- 资源：
-  - `POST /sync/pull`（自上次 `cursor` 起的变更）
-  - `POST /sync/push`（上传本地变更）
-  - `GET/POST/PUT/DELETE /accounts`
-  - `GET/POST/PUT/DELETE /categories`
-  - `GET/POST/PUT/DELETE /transactions`
-  - `GET /reports/summary?scope=monthly&start=YYYY-MM&limit=N`
-  - `GET /budgets`、`POST /budgets`
+## 5. 同步扩展设计（可选，接口占位）
+- 接口定义：
+```ts
+interface SyncService {
+  pull(sinceCursor: string | null): Promise<PullResult>;
+  push(changes: LocalChanges): Promise<PushResult>;
+  isEnabled(): boolean;
+}
+```
+- 默认实现：`NoopSyncService`，返回 `isEnabled=false`，其余为空实现。
+- 启用云后：注入 `RemoteSyncService`（鉴权、冲突合并、增量同步）。
 
-统一字段：`id, created_at, updated_at, deleted`；金额用 `amount_cents`。
+## 6. API（附录，可选）
+- 仅保留为附录，作为未来云端实现蓝图；当前本地 MVP 不依赖。
 
-## 6. 报表与查询
-- 月度/年度汇总：见 4.1 SQL；年度默认自然年，亦可提供账期年。
-- 维度扩展：账户、标签、商家分组；大表建议物化视图或增量汇总表。
-
-## 7. 客户端实现要点
-- 状态管理：Flutter Riverpod/Bloc；表单可编辑缓存；失败重试。
-- DB 抽象：Repository 封装查询；统一金额换算与币种。
+## 7. 客户端实现要点（本地优先）
+- 状态管理：Riverpod/Bloc；表单可编辑缓存；失败重试（针对本地写入与文件访问）。
+- DB：Repository 封装查询；统一金额换算与币种；加密密钥管理。
 - 国际化与无障碍：Intl；动态字体；深色模式。
 - 媒体：附件压缩、懒加载；权限网关。
 
-## 8. 安全与隐私
-- 本地：SQLCipher 或平台安全区；应用锁（生物识别）。
-- 传输：HTTPS；后端敏感字段加密；最小权限访问。
-- 合规：GDPR/本地法规；数据导出/删除权。
+## 8. 安全与隐私（本地）
+- SQLCipher 或平台安全区；应用锁（生物识别）。
+- 备份/恢复：本地导出加密归档；未来扩展云备份。
 
-## 9. 同步与冲突
-- 策略：LWW + 领域校验；转账成对核对；分类重命名保留历史引用。
-- 版本：每条记录 `version` 自增；返回冲突集供客户端合并。
+## 9. 同步与冲突（扩展）
+- 策略预留：LWW + 领域校验；转账成对核对；分类重命名保留历史引用。
 
 ## 10. 性能与观测
-- 关键路径 < 100ms；本地报表 < 300ms。
-- 观测：客户端埋点 + 后端 Prometheus/Grafana；崩溃上报。
+- 本地关键路径 < 100ms；报表 < 300ms。
+- 观测：客户端埋点；崩溃上报。
 
 ## 11. 测试
-- 单元：账期算法、预算计算、同步合并。
-- 集成：多账户转账一致性、离线→在线回放。
-- 端到端：TTB、导入/导出、报表正确性。
+- 单元：账期算法、预算计算、余额/转账一致性。
+- 集成：导入/导出、附件存取、通知触发。
+- 端到端：TTB、报表正确性。
 
-## 12. 交付与部署（后端）
-- 容器化：Docker；数据库迁移：Prisma/Knex/Flyway。
-- 环境：dev/staging/prod；备份与只读副本；对象存储生命周期策略。
-
-## 13. 创新可行性
-- 智能账期：周期聚类（如按发薪/还款日）。
-- AI 分类纠错：本地关键词 + 轻量模型，云端精修。
-- 现金流预测：ARIMA/Prophet 或轻量回归。
-- 规则自动化：可视化规则（IFTTT风格），沙箱执行。
+## 12. 路线图（技术）
+- M1：本地数据模型与账期查询、记一笔全链路。
+- M2：预算与报表、导入导出、加密与备份。
+- M3（扩展）：云同步与共享、多端发布。
 
 # 记账本 APP - 技术方案与架构设计
 
